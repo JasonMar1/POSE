@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Claude Code local settings/state
+.claude/
+
+# Excluded on purpose
+README.md
+
+# Model weights (Ultralytics downloads yolo11n-pose.pt automatically on first run)
+*.pt
