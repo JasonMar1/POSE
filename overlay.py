@@ -103,7 +103,7 @@ def _text_w(s, font):
 
 def draw_overlay(frame, exercise, count, stage, angle, hit_depth,
                  rom_frac=0.0, reject_msg=None, wrist_h=None,
-                 kpts_xy=None, side=None, show_tips=True):
+                 kpts_xy=None, side=None, show_tips=True, goal=None):
     H, W = frame.shape[:2]
 
     if reject_msg:
@@ -119,7 +119,9 @@ def draw_overlay(frame, exercise, count, stage, angle, hit_depth,
     if kpts_xy is not None and side in ("left", "right"):
         highlight_joint(frame, kpts_xy, exercise[side], accent)
 
-    card(frame, 24, 24, 300, 150)  # stat card
+    shown_count = f"{count}/{goal}" if goal else str(count)
+    cw = _text_w(shown_count, get_font(66, True))
+    card(frame, 24, 24, max(300, 52 + cw + 76), 150)  # stat card; grows for long "100/100" text
     rcx, rcy, rr = W - 118, 118, 74
     ring(frame, rcx, rcy, rr, 14, rom_frac, accent)  # ROM ring
 
@@ -133,8 +135,7 @@ def draw_overlay(frame, exercise, count, stage, angle, hit_depth,
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     d = ImageDraw.Draw(pil)
     d.text((44, 40), exercise["label"], font=get_font(24, True), fill=THEME["text"])
-    d.text((44, 78), str(count),        font=get_font(66, True), fill=THEME["text"])
-    cw = _text_w(str(count), get_font(66, True))
+    d.text((44, 78), shown_count,        font=get_font(66, True), fill=THEME["text"])
     d.text((52 + cw, 128), "REPS",       font=get_font(20), fill=THEME["sub"])
     d.text((44, 150), f"stage: {stage}", font=get_font(20), fill=THEME["sub"])
     d.text((rcx, rcy - 6), f"{int(rom_frac*100)}%", font=get_font(34, True),
@@ -144,4 +145,41 @@ def draw_overlay(frame, exercise, count, stage, angle, hit_depth,
         d.text((W // 2, H - 90 + 26), status, font=pill_font, fill=THEME["text"], anchor="mm")
     if wrist_h is not None:
         d.text((28, H - 34), f"h {wrist_h:+.2f}", font=get_font(16), fill=THEME["sub"])
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+
+def draw_goal_completion(frame, exercise, goal):
+    """Return a copy of `frame` blurred and dimmed, with a centered
+    "goal complete" card on top. Pure function: nothing is drawn in place."""
+    H, W = frame.shape[:2]
+
+    # 1) Blur. Blurring a quarter-size copy and scaling it back up is much
+    #    cheaper than a huge-kernel blur at full size, and looks just as soft.
+    small = cv2.resize(frame, (max(1, W // 4), max(1, H // 4)), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 5)
+    img = cv2.resize(small, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # 2) Dim, so the white text stays readable over bright backgrounds.
+    img = cv2.convertScaleAbs(img, alpha=0.5)
+
+    # 3) Centered card (card() draws in place on the image it is given).
+    cw, ch = min(560, W - 40), 330
+    cx, cy = (W - cw) // 2, (H - ch) // 2
+    card(img, cx, cy, cw, ch, radius=28, alpha=0.88)
+
+    # 4) Green check-mark badge, drawn with cv2 before the PIL text pass.
+    bx, by, br = W // 2, cy + 78, 42
+    cv2.circle(img, (bx, by), br, bgr(THEME["good"]), -1, cv2.LINE_AA)
+    check = np.array([(bx - 18, by + 2), (bx - 5, by + 15), (bx + 20, by - 13)], np.int32)
+    cv2.polylines(img, [check], False, (255, 255, 255), 7, cv2.LINE_AA)
+
+    # 5) Text, in one anti-aliased PIL pass like draw_overlay.
+    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    d = ImageDraw.Draw(pil)
+    d.text((W // 2, cy + 168), "GOAL COMPLETE!", font=get_font(40, True),
+           fill=THEME["good"], anchor="mm")
+    d.text((W // 2, cy + 224), f"{goal} {exercise['label']}", font=get_font(28, True),
+           fill=THEME["text"], anchor="mm")
+    d.text((W // 2, cy + 276), "Great work!", font=get_font(22),
+           fill=THEME["sub"], anchor="mm")
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)

@@ -1,12 +1,28 @@
 import ctypes
+import os
+import time
 from collections import deque
+from typing import NamedTuple
+
+# Must be set before cv2 is imported anywhere in the process. With MSMF's
+# hardware transforms on, opening a webcam can take a minute. With them off it opens in under a second.
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from overlay import draw_overlay
+from overlay import draw_goal_completion, draw_overlay
 import torch
+
+CELEBRATION_SECONDS = 4.0   # how long the "goal complete" screen stays up
+CELEBRATION_FADE = 0.5      # seconds spent fading from the live view into it
+
+
+class SessionResult(NamedTuple):
+    """What run_session hands back to its caller."""
+    count: int             # reps counted
+    goal_reached: bool     # True only if a goal was set and the user hit it
 
 
 # ----------------------------------------------------------------------------
@@ -60,7 +76,7 @@ EXERCISES = {
         "good_depth": 80,
         "label": "PUSH-UPS",
     },
-        "shoulder_pressshoulder_press": {
+        "shoulder_press": {
         "left": ("l_shoulder", "l_elbow", "l_wrist"),
         "right": ("r_shoulder", "r_elbow", "r_wrist"),
         "down_thresh": 80,
@@ -116,9 +132,27 @@ def wrist_height(kpts_xy, kpts_conf, side):
         return None
     return float(kpts_xy[sh][1] - kpts_xy[wr][1]) / scale
 
-def uses_wrist_gate(exercise):
-    """True if the excersise defines wrist-height constraints"""
-    return ("wrist_down_max" in exercise) or ("wrist_up_min" in exercise)
+
+def pick_person(result, exercise):
+    """Index of the detection most likely to be the person doing the workout,
+    or None if nobody was detected.
+
+    Each person is scored by (how sure the model is that it's a person) x (how
+    sure it is about the joints THIS exercise uses, on the better-visible side).
+    Posters, t-shirt prints and other person-shaped clutter tend to have vague
+    joints, so they lose to someone actually performing the movement."""
+    if result.boxes is None or result.keypoints is None or len(result.keypoints) == 0:
+        return None
+    box_conf = result.boxes.conf.cpu().numpy()
+    kpt_conf = result.keypoints.conf.cpu().numpy()
+    scores = []
+    for i in range(len(box_conf)):
+        joint_conf = max(
+            float(np.mean(kpt_conf[i][[KP[n] for n in exercise[side]]]))
+            for side in ("left", "right"))
+        scores.append(float(box_conf[i]) * joint_conf)
+    return int(np.argmax(scores))
+
 
 def hide_kp(result, indices):
     if not indices or result.keypoints is None:
@@ -133,16 +167,27 @@ def hide_kp(result, indices):
 
 def load_model(model_path="yolo11n-pose.pt"):
     """Load the YOLO pose model and pick a device. Meant to be called once and
-    reused across sessions -- reloading it per exercise would be slow."""
+    reused across sessions"""
     model = YOLO(model_path)
     device = 0 if torch.cuda.is_available() else "cpu"   # 0 = first GPU
     model.to(device)
     return model, device
 
 
+def list_cameras():
+    """Names of the connected cameras, in the order OpenCV indexes them
+    (name at position i -> camera index i). Reads the device list from Windows
+    Returns [] if the list can't be read."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        return FilterGraph().get_input_devices()
+    except Exception:
+        return []
+
+
 def open_capture(source, width=1280, height=720, fps=30):
     """Open a webcam (digit source, e.g. 0) or a video file (path). Raises
-    RuntimeError on failure instead of exiting, so callers (like a GUI) can
+    RuntimeError on failure instead of exiting, so the GUI can
     handle it without killing the whole process."""
     is_webcam = str(source).isdigit()
     if is_webcam:
@@ -179,21 +224,59 @@ def _center_window(window_name, frame_w, frame_h):
     cv2.moveWindow(window_name, x, y)
 
 
+def _quit_requested(window_name, delay_ms=1):
+    """Wait up to `delay_ms` for input and report whether the user wants out:
+    either they pressed 'q', or they closed the window with its X button
+    (which doesn't stop a loop by itself -- imshow would just recreate it)."""
+    if cv2.waitKey(delay_ms) & 0xFF == ord("q"):
+        return True
+    return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+
+
+def _show_celebration(window_name, frame, exercise, goal):
+    """Fade from the live frame into the blurred "goal complete" card and hold
+    it for CELEBRATION_SECONDS. 'q' or closing the window cuts it short.
+    The background is the last frame, frozen: it is blurred once, not per frame."""
+    done = draw_goal_completion(frame, exercise, goal)
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= CELEBRATION_SECONDS:
+            return
+        if elapsed < CELEBRATION_FADE:
+            a = elapsed / CELEBRATION_FADE
+            shown = cv2.addWeighted(frame, 1 - a, done, a, 0)
+        else:
+            shown = done
+        cv2.imshow(window_name, shown)
+        if _quit_requested(window_name, 30):   # ~30ms: no busy-spinning the CPU
+            return
+
+
 def run_session(exercise_key, model, device, cap, smooth=5,
-                window_name="POSE (press q to quit)", flush_frames=3, mirror=True):
-    """Run one live workout session for a single exercise and return the final
-    rep count. Does not own `model`, `device`, or `cap` -- the caller is
-    responsible for their lifecycle, so this can be called again for a
-    different exercise without reloading the model or reopening the camera.
+                window_name="POSE (press q to quit)", flush_frames=3, mirror=True,
+                goal=None):
+    """Run one live workout session for a single exercise and return a
+    SessionResult(count, goal_reached). Does not own `model`, `device`, or
+    `cap` -- the caller is responsible for their lifecycle, so this can be
+    called again for a different exercise without reloading the model or
+    reopening the camera.
 
     `mirror`: flip the feed horizontally so it behaves like a mirror (left/right
     match your own movement, as in a webcam/selfie view). Leave this on for a
     live webcam; turn it off when replaying a pre-recorded video file, since
-    flipping a file source would misrepresent the footage."""
+    flipping a file source would misrepresent the footage.
+
+    `goal`: target number of reps (a whole number >= 1), or None for a free
+    workout. With a goal the HUD shows "count/goal"; when it is reached the
+    view blurs behind a congratulations card for a few seconds and the session
+    ends by itself."""
+    if goal is not None and (isinstance(goal, bool) or not isinstance(goal, int) or goal < 1):
+        raise ValueError(f"goal must be a whole number >= 1 or None, got {goal!r}")
     exercise = EXERCISES[exercise_key]
 
-    # The camera may have been idle since the last session; drop a few frames
-    # so the first one we show is fresh, not something buffered from before.
+    # The camera was just opened; drop a few frames so auto-exposure can
+    # settle and the first frame we show isn't dark.
     for _ in range(flush_frames):
         cap.read()
 
@@ -205,6 +288,7 @@ def run_session(exercise_key, model, device, cap, smooth=5,
     bottom_seen = False
     angle_buf = deque(maxlen=smooth)
     positioned = False   # center the window once, on its first appearance
+    goal_reached = False
 
     print(f"Counting {exercise['label']}. Press 'q' in the window to quit.")
     while True:
@@ -217,14 +301,22 @@ def run_session(exercise_key, model, device, cap, smooth=5,
         # ---- The CV step: run pose estimation on this frame ----
         results = model(frame, device=device, verbose=False)
         r = results[0]
+
+        # Keep only the person most likely doing the workout; everything else
+        # in the room (posters, shirts, bystanders) is dropped before drawing.
+        person = pick_person(r, exercise)
+        if person is not None:
+            r = r[person:person + 1]
+
         kpts_xy = kpts_conf = None
         if r.keypoints is not None and len(r.keypoints) > 0:
             kpts_xy = r.keypoints.xy[0].cpu().numpy().copy()
             kpts_conf = r.keypoints.conf[0].cpu().numpy().copy()
 
         hide_kp(r, HIDE_KPTS)
-        # r.plot() renders the detected skeleton onto the frame for us.
-        annotated = r.plot()
+        # r.plot() renders the skeleton onto the frame; boxes=False drops the
+        # bounding box and its person confidence tag.
+        annotated = r.plot(boxes=False)
 
         angle, wrist_h, side = None, None, None
         if kpts_xy is not None:
@@ -286,13 +378,25 @@ def run_session(exercise_key, model, device, cap, smooth=5,
         rom_frac = 0.0 if angle is None else max(0.0, min(1.0, (hi - angle) / (hi - lo)))
         annotated = draw_overlay(annotated, exercise, count, stage, angle, hit_depth,
                                  rom_frac=rom_frac, reject_msg=reject_msg, wrist_h=wrist_h,
-                                 kpts_xy=kpts_xy, side=side, show_tips=bottom_seen)
+                                 kpts_xy=kpts_xy, side=side, show_tips=bottom_seen,
+                                 goal=goal)
         cv2.imshow(window_name, annotated)
         if not positioned:
             _center_window(window_name, annotated.shape[1], annotated.shape[0])
             positioned = True
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        if _quit_requested(window_name):
             break
 
-    cv2.destroyWindow(window_name)
-    return count
+        # Checked AFTER the frame is shown (so the last live frame reads
+        # if the goal got completed) and after the quit check (so quitting on the final rep
+        # doesn't trigger a celebration the user didn't wait for).
+        if goal is not None and count >= goal:
+            goal_reached = True
+            _show_celebration(window_name, annotated, exercise, goal)
+            break
+
+    try:
+        cv2.destroyWindow(window_name)
+    except cv2.error:
+        pass  # window was already closed with its X button
+    return SessionResult(count, goal_reached)
